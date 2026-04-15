@@ -28,6 +28,14 @@ from src.retriever import (
 )
 from src.ranking.reranker import rerank
 
+from src.summary_pipeline import (
+    is_multi_turn_summary_query,
+    extract_topic_queries,
+    retrieve_multi_topic_chunks,
+    build_summary_generation_query,
+    reliability_warning,
+)
+
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
 def parse_args() -> argparse.Namespace:
@@ -105,7 +113,8 @@ def get_answer(
     artifacts: Optional[Dict] = None,
     golden_chunks: Optional[list] = None,
     is_test_mode: bool = False,
-    additional_log_info: Optional[Dict[str, Any]] = None
+    additional_log_info: Optional[Dict[str, Any]] = None,
+    chat_history = None
 ) -> Union[str, Tuple[str, List[Dict[str, Any]], Optional[str]]]:
     """
     Run a single query through the pipeline.
@@ -130,6 +139,28 @@ def get_answer(
         ranked_chunks = []
     elif cfg.use_indexed_chunks:
         ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks)
+    
+    #add multi-turn summarization pipeline
+    elif chat_history and is_multi_turn_summary_query(question):
+        print("[DEBUG] USING SUMMARY PIPELINE")
+        topic_queries = extract_topic_queries(chat_history, max_topics=cfg.max_history_turns)
+        print(f"[DEBUG] topic queries = {topic_queries}")
+        topk_idxs, scores, summary_debug = retrieve_multi_topic_chunks(
+            topic_queries=topic_queries,
+            retrievers=retrievers,
+            ranker=ranker,
+            chunks=chunks,
+            top_k=cfg.top_k,
+            num_candidates=max(cfg.num_candidates, cfg.top_k + 10),
+        )
+        ranked_chunks = [chunks[i] for i in topk_idxs]
+        print("[DEBUG] top retrieved chunk previews:")
+        for i, idx in enumerate(topk_idxs[:3]):
+            print(f"[DEBUG] chunk {i+1} idx={idx}: {chunks[idx][:200]}")
+        if additional_log_info is not None:
+            additional_log_info["used_summary_pipeline"] = True
+            additional_log_info["summary_pipeline"] = summary_debug
+    #end of multi-turn summarization pipeline
     else:
         retrieval_query = question
         # print(f"Retrieval query: {retrieval_query}")
@@ -313,7 +344,15 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 break
             
             effective_q = q
-            if cfg.enable_history and chat_history:
+            should_contextualize = (
+                cfg.enable_history
+                and chat_history
+                and not is_multi_turn_summary_query(q)
+            )
+            print(f"[DEBUG] original query = {q}")
+            print(f"[DEBUG] is summary query? {is_multi_turn_summary_query(q)}")
+            if should_contextualize:
+            #if cfg.enable_history and chat_history:
                 try:
                     effective_q = contextualize_query(q, chat_history, cfg.gen_model)
                     additional_log_info["is_contextualizing_query"] = True
@@ -326,7 +365,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                     effective_q = q
             
             # Use the single query function. get_answer also renders the streaming markdown and takes care of logging, so we need not do anything else here.
-            ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
+            ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info, chat_history=chat_history)
 
             # Update Chat history (make it atomic for user + assistant turn)
             try:
