@@ -32,6 +32,7 @@ from src.cache import get_cache
 
 from src.summary_pipeline import (
     is_multi_turn_summary_query,
+    maybe_summary_guidance,
     extract_topic_queries,
     retrieve_multi_topic_chunks,
     build_summary_generation_query,
@@ -176,6 +177,12 @@ def get_answer(
     ranked_chunks: List[str] = []
     topk_idxs: List[int] = []
     scores = []
+    generation_query = question 
+    summary_warning = ""
+
+    # For 100% goal
+    # Summary requests depend on the evolving chat history, so do not serve them from cache.
+    is_summary_request = bool(chat_history) and is_multi_turn_summary_query(question)
 
     cache = get_cache(cfg)
     normalized_question = cache.normalize_question(question)
@@ -205,13 +212,16 @@ def get_answer(
         # No chunks - baseline mode
         ranked_chunks = []
     elif cfg.use_indexed_chunks:
-        ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks)
+        ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks, cfg, args)
     
     #add multi-turn summarization pipeline
-    elif chat_history and is_multi_turn_summary_query(question):
+
+    elif is_summary_request:
         print("[DEBUG] USING SUMMARY PIPELINE")
-        topic_queries = extract_topic_queries(chat_history, max_topics=cfg.max_history_turns)
+
+        topic_queries = extract_topic_queries(chat_history)
         print(f"[DEBUG] topic queries = {topic_queries}")
+
         topk_idxs, scores, summary_debug = retrieve_multi_topic_chunks(
             topic_queries=topic_queries,
             retrievers=retrievers,
@@ -220,14 +230,22 @@ def get_answer(
             top_k=cfg.top_k,
             num_candidates=max(cfg.num_candidates, cfg.top_k + 10),
         )
+
         ranked_chunks = [chunks[i] for i in topk_idxs]
-        print("[DEBUG] top retrieved chunk previews:")
-        for i, idx in enumerate(topk_idxs[:3]):
-            print(f"[DEBUG] chunk {i+1} idx={idx}: {chunks[idx][:200]}")
+        generation_query = build_summary_generation_query(question, topic_queries)
+        summary_warning = reliability_warning(
+            num_chunks=len(ranked_chunks),
+            num_topics=len(topic_queries),
+        )
+
         if additional_log_info is not None:
             additional_log_info["used_summary_pipeline"] = True
             additional_log_info["summary_pipeline"] = summary_debug
+            additional_log_info["summary_generation_query"] = generation_query
+            additional_log_info["summary_warning"] = summary_warning
+
     #end of multi-turn summarization pipeline
+    
     else:
         retrieval_query = question
         # print(f"Retrieval query: {retrieval_query}")
@@ -299,28 +317,33 @@ def get_answer(
     system_prompt = args.system_prompt_mode or cfg.system_prompt_mode
 
     use_double = getattr(args, "double_prompt", False) or cfg.use_double_prompt
+    #For 100% goal
     if use_double:
         stream_iter = double_answer(
-            question,
-            ranked_chunks,
-            model_path,
-            max_tokens=cfg.max_gen_tokens,
-            system_prompt_mode=system_prompt,
-        )
+        query=generation_query,
+        chunks=ranked_chunks,
+        model_path=model_path,
+        max_tokens=cfg.max_gen_tokens,
+        system_prompt_mode=system_prompt,
+    )
     else:
         stream_iter = answer(
-            question,
-            ranked_chunks,
-            model_path,
-            max_tokens=cfg.max_gen_tokens,
-            system_prompt_mode=system_prompt,
-        )
+        query=generation_query,
+        chunks=ranked_chunks,
+        model_path=model_path,
+        max_tokens=cfg.max_gen_tokens,
+        system_prompt_mode=system_prompt,
+    )
+    # for 100% goal
 
     if is_test_mode:
         ans = dedupe_generated_text("".join(stream_iter))
     else:
         # Accumulate the full text while rendering incremental Markdown chunks
         ans = render_streaming_ans(console, stream_iter)
+        
+        if is_summary_request and summary_warning:
+            ans = f"[WARNING] {summary_warning}\n\n" + ans
 
         # Logging
         meta = artifacts.get("meta", [])
@@ -343,24 +366,25 @@ def get_answer(
         )
 
     # Step 5: Store in semantic cache
-    cache_payload = {
-        "answer": ans,
-        "chunks_info": chunks_info,
-        "hyde_query": hyde_query,
-        "chunk_indices": topk_idxs,
-    }
-    if question_embedding is None:
-        question_embedding = cache.compute_embedding(normalized_question, retrievers, cfg.embed_model)
-    cache.store(
-        config_cache_key,
-        normalized_question,
-        question_embedding,
-        cache_payload
-    )
+    if not is_summary_request:
+        cache_payload = {
+            "answer": ans,
+            "chunks_info": chunks_info,
+            "hyde_query": hyde_query,
+            "chunk_indices": topk_idxs,
+        }
+        if question_embedding is None:
+            question_embedding = cache.compute_embedding(normalized_question, retrievers, cfg.embed_model)
+        cache.store(
+            config_cache_key,
+            normalized_question,
+            question_embedding,
+            cache_payload
+        )
 
     if is_test_mode:
         return ans, chunks_info, hyde_query
-    
+
     return ans
 
 def render_streaming_ans(console, stream_iter):
@@ -437,6 +461,13 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 print("Goodbye!")
                 break
             
+            # For 100% goal
+            guidance = maybe_summary_guidance(q)
+            if guidance:
+                console.print(f"\n[bold yellow]{guidance}[/bold yellow]\n")
+            # For 100% goal
+
+
             effective_q = q
             should_contextualize = (
                 cfg.enable_history

@@ -1,40 +1,85 @@
-from typing import List, Tuple, Dict
+import re
+from typing import List, Tuple, Dict, Optional
+
+
+SUMMARY_PATTERNS = [
+    r"\bsummarize (?:what|everything|all|the things)? ?(?:we )?(?:discussed|covered|talked about)(?: so far)?\b",
+    r"\bsummarize (?:our|the) (?:chat|conversation|discussion)\b",
+    r"\bgive me (?:a )?(?:summary|recap) of (?:our|the) (?:chat|conversation|discussion)\b",
+    r"\bwhat did we (?:discuss|cover|talk about)\b",
+    r"\bwhat have we (?:discussed|covered) so far\b",
+    r"\brecap (?:our|the)? ?(?:chat|conversation|discussion)?\b",
+    r"\bkey points from (?:our|the) (?:chat|conversation|discussion)\b",
+]
+
+SUMMARY_SIGNALS = {
+    "summary", "summarize", "summarise", "recap", "overview",
+    "key points", "highlights", "main points",
+}
+CONVERSATION_SIGNALS = {
+    "chat", "conversation", "discussion", "discussed", "covered",
+    "so far", "earlier", "before", "previous", "we talked",
+}
 
 # detect whether the user query is multi-turn summary query or not
 def is_multi_turn_summary_query(query: str) -> bool:
-    q = query.lower()
-    keywords = [
-        "summarize what we discussed",
-        "summary of conversation",
-        "what we discussed",
-        "what did we talk",
-        "key points from our discussion",
-        "recap",
-        "previous discussion",
-        "previous conversation",
-        "previous chat",
-        "previous chat",
-        "summarize our chat",
-        "summarize our conversation",
-        "summarize the conversation",
+    q = query.lower().strip()
+    if not q:
+        return False
+
+    for pattern in SUMMARY_PATTERNS:
+        if re.search(pattern, q):
+            return True
+
+    has_summary_signal = any(signal in q for signal in SUMMARY_SIGNALS)
+    has_conversation_signal = any(signal in q for signal in CONVERSATION_SIGNALS)
+    return has_summary_signal and has_conversation_signal
+
+
+# If the user seems to want a conversation recap but uses a vague phrase, provide a small hint about supported phrasing.
+def maybe_summary_guidance(query: str) -> str:
+    q = query.lower().strip()
+    if not q:
+        return ""
+
+    vague_summary_requests = [
         "give me a summary",
+        "summary please",
+        "summarize",
+        "recap please",
+        "can you recap",
     ]
-    return any(k in q for k in keywords)
+    if any(phrase in q for phrase in vague_summary_requests) and not is_multi_turn_summary_query(q):
+        return (
+            "If you want a summary of this chat, try asking something like: "
+            "'summarize what we discussed so far' or 'give me a recap of our conversation'."
+        )
+    return ""
 
-# Extract recent user queries as topic queries.
-def extract_topic_queries(chat_history: List[Dict], max_topics: int = 4) -> List[str]:
 
-    user_queries = [turn["content"] for turn in chat_history if turn["role"] == "user"]
+# Extract topic queries from ALL prior user turns in the current chat,not just a fixed recent window. Exclude summary-like turns themselves.
+def extract_topic_queries(chat_history: List[Dict], max_topics: Optional[int] = None) -> List[str]:
+    user_queries = [turn["content"] for turn in chat_history if turn.get("role") == "user"]
 
-    # take last 4 queries in current implementation
-    recent = user_queries[-max_topics:]
+    topics: List[str] = []
+    seen = set()
 
-    topics = []
-    for q in recent:
-        cleaned = q.strip()
-        if cleaned and not is_multi_turn_summary_query(cleaned):
-            topics.append(cleaned)
+    for q in user_queries:
+        cleaned = _normalize_query_text(q)
+        if not cleaned:
+            continue
+        if is_multi_turn_summary_query(cleaned):
+            continue
 
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+
+        topics.append(cleaned)
+        seen.add(lowered)
+
+    if max_topics is not None and max_topics > 0:
+        return topics[-max_topics:]
     return topics
 
 def _normalize_query_text(query: str) -> str:
@@ -43,19 +88,11 @@ def _normalize_query_text(query: str) -> str:
     return q
 
 
-# Lightweight query enhancement after topic extraction.
+# Make short or vague topic queries a little more specific before retrieval.
 def enhance_topic_query(query: str) -> str:
-    """
-    Reformulate a topic query into a slightly more retrieval-friendly form
-    while preserving its original meaning.
-
-    This is intentionally lightweight and deterministic so it is easy to
-    analyze in the final report.
-    """
     q = _normalize_query_text(query)
     q_lower = q.lower()
 
-    # Remove very conversational wrappers.
     conversational_prefixes = [
         "can you explain ",
         "could you explain ",
@@ -70,7 +107,6 @@ def enhance_topic_query(query: str) -> str:
             q_lower = q.lower()
             break
 
-    # Preserve intent but add retrieval-friendly scaffolding.
     if q_lower.startswith("what is "):
         core = q[8:].strip(" ?.")
         return f"definition of {core} in database systems"
@@ -89,6 +125,8 @@ def enhance_topic_query(query: str) -> str:
         return f"{q} in database systems"
 
     return q
+
+
 
 # Run retrieval for each topic and merge scores.
 def retrieve_multi_topic_chunks(
@@ -136,14 +174,16 @@ def retrieve_multi_topic_chunks(
 
     return topk_idxs, scores, debug_info
 
-# generate structured result, to be completed
-def build_summary_generation_query(original_query: str) -> str:
-
-    topic_block = "\n".join(f"- {topic}" for topic in topic_queries) if topic_queries else "- No explicit topics detected"
+# generate structured result.
+def build_summary_generation_query(original_query: str, topic_queries: List[str]) -> str:
+    if topic_queries:
+        topic_block = "\n".join(f"- {topic}" for topic in topic_queries)
+    else:
+        topic_block = "- No explicit topics detected"
     return (
         f"{original_query}\n\n"
-        "Generate a structured summary of the previous discussion using ONLY the provided textbook excerpts.\n"
-        "Focus on covering all major topics from the discussion.\n\n"
+        "Generate a structured summary of the previous discussion using only the provided textbook excerpts.\n"
+        "Try to cover all main topics from the discussion.\n\n"
         "Topics that should be covered:\n"
         f"{topic_block}\n\n"
         "Organize the answer into exactly these sections:\n"
@@ -153,12 +193,12 @@ def build_summary_generation_query(original_query: str) -> str:
         "If some topics are not well supported by the retrieved excerpts, state that clearly."
     )
 
-# Generate reliability warning based on number of retrieved chunks. To be completed
+# Generate reliability warning based on number of retrieved chunks.
 def reliability_warning(num_chunks: int, num_topics: int, threshold: int = 3) -> str:
     if num_topics <= 0:
         return "Warning: No clear prior user topics were detected, so the summary may be incomplete."
     if num_chunks < threshold:
         return "Warning: Only a small number of supporting chunks were retrieved, so the summary may be incomplete or inaccurate."
     if num_chunks < num_topics:
-        return "Warning: Fewer chunks were retrieved than the number of detected topics, so some discussion points may be under-covered."
+        return "Warning: Fewer chunks were retrieved than the number of detected topics, so some key points may be under-covered."
     return ""
